@@ -2022,29 +2022,48 @@ describe("composerDraftStore per-model sticky options", () => {
     resetComposerDraftStore();
   });
 
-  it("remembers sticky options per model and restores them on model switch", () => {
-    const store = useComposerDraftStore.getState();
+  it.each([
+    {
+      driver: CODEX_DRIVER,
+      instanceId: CODEX_INSTANCE,
+      first: "gpt-5.3-codex",
+      second: "gpt-5.4",
+      optionId: "reasoningEffort",
+    },
+    {
+      driver: ProviderDriverKind.make("acpRegistry"),
+      instanceId: ProviderInstanceId.make("acpRegistry_dropstone"),
+      first: "dropstone/dropstone-fast",
+      second: "dropstone/dropstone-pro",
+      optionId: "effort",
+    },
+  ])(
+    "remembers distinct $optionId choices for each model",
+    ({ driver, instanceId, first, second, optionId }) => {
+      const store = useComposerDraftStore.getState();
 
-    store.setProviderModelOptions(
-      threadRef,
-      CODEX_DRIVER,
-      toSelections({ reasoningEffort: "xhigh" }),
-      { instanceId: CODEX_INSTANCE, model: "gpt-5.3-codex", persistSticky: true },
-    );
-    store.setProviderModelOptions(
-      threadRef,
-      CODEX_DRIVER,
-      toSelections({ reasoningEffort: "high" }),
-      { instanceId: CODEX_INSTANCE, model: "gpt-5.4", persistSticky: true },
-    );
+      store.setProviderModelOptions(threadRef, driver, toSelections({ [optionId]: "low" }), {
+        instanceId,
+        model: first,
+        persistSticky: true,
+      });
+      store.setProviderModelOptions(threadRef, driver, toSelections({ [optionId]: "high" }), {
+        instanceId,
+        model: second,
+        persistSticky: true,
+      });
+      store.setProviderModelOptions(threadRef, driver, toSelections({ [optionId]: "xhigh" }), {
+        instanceId,
+        model: first,
+        persistSticky: true,
+      });
 
-    expect(useComposerDraftStore.getState().stickyOptionsByModelByProvider[CODEX_INSTANCE]).toEqual(
-      {
-        "gpt-5.3-codex": toSelections({ reasoningEffort: "xhigh" }),
-        "gpt-5.4": toSelections({ reasoningEffort: "high" }),
-      },
-    );
-  });
+      expect(useComposerDraftStore.getState().stickyOptionsByModelByProvider[instanceId]).toEqual({
+        [first]: toSelections({ [optionId]: "xhigh" }),
+        [second]: toSelections({ [optionId]: "high" }),
+      });
+    },
+  );
 
   it("keeps the sticky model's own traits when traits change on another shown model", () => {
     const store = useComposerDraftStore.getState();
@@ -2076,6 +2095,44 @@ describe("composerDraftStore per-model sticky options", () => {
       modelSelection(CODEX_DRIVER, "gpt-5.3-codex", { reasoningEffort: "xhigh" }),
     );
     expect(state.stickyOptionsByModelByProvider[CODEX_INSTANCE]?.["gpt-5.4"]).toBeUndefined();
+  });
+
+  it("restores each ACP model's saved effort when the composer starts again", async () => {
+    const storage = createMemoryStorage();
+    vi.stubGlobal("localStorage", storage);
+    vi.stubGlobal("window", new EventTarget());
+    const driver = ProviderDriverKind.make("acpRegistry");
+    const instanceId = ProviderInstanceId.make("acpRegistry_dropstone");
+    const efforts = {
+      "dropstone/dropstone-fast": "max",
+      "dropstone/dropstone-pro": "high",
+      "dropstone/dropstone-heavy": "medium",
+    };
+
+    vi.resetModules();
+    try {
+      const { useComposerDraftStore: first } = await import("./composerDraftStore");
+      for (const [model, effort] of Object.entries(efforts)) {
+        first.getState().setProviderModelOptions(threadRef, driver, toSelections({ effort }), {
+          instanceId,
+          model,
+          persistSticky: true,
+        });
+      }
+      window.dispatchEvent(new Event("beforeunload"));
+
+      vi.stubGlobal("window", new EventTarget());
+      vi.resetModules();
+      const { useComposerDraftStore: restarted } = await import("./composerDraftStore");
+      expect(restarted.getState().stickyOptionsByModelByProvider[instanceId]).toEqual(
+        Object.fromEntries(
+          Object.entries(efforts).map(([model, effort]) => [model, toSelections({ effort })]),
+        ),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      vi.resetModules();
+    }
   });
 
   it("seeds per-model memory from a persisted sticky selection on upgrade", () => {

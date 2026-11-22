@@ -374,10 +374,20 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
                   ),
               }
             : {}),
-          onSessionConfigurationUpdate: (configOptions, modeState, modelState) =>
+          onSessionConfigurationUpdate: (
+            configOptions,
+            modeState,
+            modelState,
+            configOptionsKnown,
+          ) =>
             runtimeCoordinator.publishLiveConfiguration(
               options.instanceId,
-              normalizeAcpRegistryLiveConfiguration(configOptions, modeState, modelState),
+              normalizeAcpRegistryLiveConfiguration(
+                configOptions,
+                modeState,
+                modelState,
+                configOptionsKnown,
+              ),
             ),
           onUrlElicitation: ({ elicitationId, url, message }) => {
             const normalizedUrl = normalizeAcpRegistryWebUrl(url);

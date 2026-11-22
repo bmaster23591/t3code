@@ -20,6 +20,14 @@ const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 // GitHub Copilot CLI advertises URL-shaped session mode ids.
 const copilotModesProfile = process.env.T3_ACP_COPILOT_MODES === "1";
+const discoveryModel = process.env.T3_ACP_DISCOVERY_MODEL;
+const discoverySwitch = process.env.T3_ACP_DISCOVERY_SWITCH;
+const discoveryModels = {
+  fast: ["low", "medium"],
+  pro: ["low", "medium", "high", "xhigh", "max"],
+  heavy: ["high", "max"],
+  plain: [],
+};
 const copilotModeId = (name: string) =>
   `https://agentclientprotocol.com/protocol/session-modes#${name}`;
 const modeOptionCategory = process.env.T3_ACP_MODE_OPTION_CATEGORY ?? "mode";
@@ -123,7 +131,7 @@ let currentModeId = antigravityProfile
   : copilotModesProfile
     ? copilotModeId("agent")
     : "ask";
-let currentModelId = antigravityProfile ? "gemini-test-low" : "default";
+let currentModelId = discoveryModel ?? (antigravityProfile ? "gemini-test-low" : "default");
 let parameterizedModelPicker = false;
 let currentReasoning = "medium";
 let currentContext = "272k";
@@ -159,6 +167,31 @@ process.once("SIGINT", () => {
 });
 
 function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
+  if (discoveryModel !== undefined) {
+    const levels = Object.entries(discoveryModels).find(([id]) => id === currentModelId)?.[1];
+    return [
+      {
+        configId: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: currentModelId,
+        options: Object.keys(discoveryModels).map((value) => ({ value, name: value })),
+      },
+      ...(levels?.length
+        ? [
+            {
+              configId: "effort",
+              name: "Reasoning",
+              category: "thought_level",
+              type: "select" as const,
+              currentValue: levels[0]!,
+              options: levels.map((value) => ({ value, name: value })),
+            },
+          ]
+        : []),
+    ];
+  }
   if (antigravityProfile) {
     return [
       {
@@ -889,7 +922,21 @@ const program = Effect.gen(function* () {
         currentModeId = request.value;
       }
       if (request.configId === "model" && typeof request.value === "string") {
+        if (discoveryModel !== undefined && discoverySwitch === "reject") {
+          return yield* AcpError.AcpRequestError.invalidParams("Mock model switch rejected");
+        }
         currentModelId = request.value;
+        if (discoveryModel !== undefined && discoverySwitch === "notify") {
+          const update = configOptions();
+          // A model setter can acknowledge before its dependent options arrive.
+          setImmediate(() => {
+            writeJsonRpcNotification("session/update", {
+              sessionId: request.sessionId,
+              update: { sessionUpdate: "config_option_update", configOptions: update },
+            });
+          });
+          return { configOptions: [] };
+        }
       }
       if (request.configId === "agent" && typeof request.value === "string") {
         currentAgent = request.value;

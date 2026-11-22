@@ -2506,6 +2506,15 @@ export const layerWsRpc = (
         [WS_METHODS.serverRefreshProviders]:
           /* Request instrumentation already owns the span; keep this helper in that context. */
           Effect.fnUntraced(function* (input) {
+            if (input.discoverAcpModel !== undefined) {
+              if (input.instanceId !== undefined) {
+                yield* providerRegistry.discoverAcpModelOptions(
+                  input.instanceId,
+                  input.discoverAcpModel,
+                );
+              }
+              return { providers: [] };
+            }
             if (input.modelCatalogOnly === true) {
               yield* providerRegistry.refreshModelCatalog;
               return { providers: [] };

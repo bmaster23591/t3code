@@ -53,6 +53,7 @@ const COMMAND_ADVERTISEMENT_GRACE = "500 millis";
 // settle it in seconds, not milliseconds; commands arrive much sooner.
 const MODEL_ADVERTISEMENT_GRACE = "5 seconds";
 const PROBE_SESSION_DELETE_TIMEOUT = "5 seconds";
+const MODEL_CONFIGURATION_TIMEOUT = "10 seconds";
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const boundedText = (value: string, maximumLength: number): string =>
@@ -210,6 +211,7 @@ export interface AcpRegistryLiveConfiguration {
   readonly currentModelId: string | null;
   readonly configOptions: AcpRegistryProbeResult["configOptions"];
   readonly modelOptionIds?: NonNullable<AcpRegistryProbeResult["modelOptionIds"]>;
+  readonly configOptionsKnown?: boolean;
   // A single model from an explicit select is the agent's deliberate catalog
   // (e.g. an entitlement change), not a cold-start placeholder.
   readonly modelsFromModelSelect?: boolean;
@@ -219,6 +221,7 @@ export function normalizeAcpRegistryLiveConfiguration(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
   modeState?: Parameters<typeof acpProviderOptionDescriptors>[0]["modeState"],
   modelState?: EffectAcpSchema.SessionModelState | null,
+  configOptionsKnown = true,
 ): AcpRegistryLiveConfiguration {
   const modelOption = findModelConfigOption(configOptions);
   const currentModelId =
@@ -257,10 +260,9 @@ export function normalizeAcpRegistryLiveConfiguration(
   );
   return {
     models,
-    currentModelId: models.some((model) => model.id === boundedCurrentModelId)
-      ? boundedCurrentModelId
-      : null,
+    currentModelId: boundedCurrentModelId,
     configOptions: descriptors,
+    configOptionsKnown,
     modelOptionIds: descriptors
       .filter((descriptor) => modelOptionIds.has(descriptor.id))
       .map((descriptor) => descriptor.id),
@@ -378,6 +380,7 @@ export interface AcpRegistryConfigurationProbeInput {
   readonly settings: AcpRegistrySettings;
   readonly cwd: string;
   readonly environment: NodeJS.ProcessEnv;
+  readonly model?: string;
 }
 
 type AcpRegistryManagementInput = AcpRegistryConfigurationProbeInput;
@@ -386,6 +389,9 @@ export interface AcpRegistryConfigurationProbeResult {
   readonly probe: AcpRegistryProbeResult;
   readonly slashCommands: ReadonlyArray<ServerProviderSlashCommand>;
   readonly skills: ReadonlyArray<ServerProviderSkill>;
+  readonly configuration?: AcpRegistryLiveConfiguration;
+  readonly modelConfiguration?: AcpRegistryLiveConfiguration;
+  readonly canDiscoverModelOptions?: true;
 }
 
 export type AcpRegistryConfigurationProbe<Requirements = never> = (
@@ -421,6 +427,27 @@ const isolateDeepSeekProbeHistory = Effect.fn("AcpRegistryProbe.isolateDeepSeekP
       args: [...launcherArgs, "--patch", patchPath, ...spawn.args.slice(launcherArgs.length)],
     };
   },
+);
+
+const prepareDropstoneProbeDatabase = Effect.fn("AcpRegistryProbe.prepareDropstoneProbeDatabase")(
+  function* (spawn: AcpSessionRuntime.AcpSpawnInput) {
+    const launchesDropstone = [spawn.command, ...spawn.args].some((arg) =>
+      /^dropstone(?:\.exe)?$/iu.test(arg.split(/[\\/]/u).at(-1) ?? ""),
+    );
+    if (!launchesDropstone) return;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-dropstone-acp-probe-" });
+    return path.join(directory, "probe.sqlite");
+  },
+  Effect.mapError(
+    (cause) =>
+      new AcpRegistryOperationError({
+        reason: "probe_failed",
+        message: "Could not prepare a temporary database for the Dropstone probe.",
+        cause,
+      }),
+  ),
 );
 
 export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeConfiguration")(
@@ -463,6 +490,7 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
             }),
         ),
       );
+      const dropstoneDatabase = yield* prepareDropstoneProbeDatabase(spawn);
       const authMethodsRef = yield* Ref.make<ReadonlyArray<AcpRegistryProbeAuthMethod>>([]);
       const authActionRef = yield* Ref.make<AcpRegistryUrlAuthAction | undefined>(undefined);
       const runtimeCoordinator = yield* Effect.serviceOption(
@@ -470,7 +498,17 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
       );
       const runtimeContext = yield* Layer.build(
         AcpSessionRuntime.layer({
-          spawn,
+          spawn:
+            dropstoneDatabase === undefined
+              ? spawn
+              : {
+                  ...spawn,
+                  env: {
+                    ...(spawn.env ?? input.environment),
+                    DROPSTONE_DB: dropstoneDatabase,
+                    DROPSTONE_DISABLE_AUTOUPDATE: "1",
+                  },
+                },
           cwd: input.cwd,
           clientCapabilities: {
             auth: { terminal: Option.isSome(pty) },
@@ -506,12 +544,21 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
       );
       const commandsAdvertised = yield* Deferred.make<void>();
       const configOptionsRef = yield* Ref.make<
-        ReadonlyArray<EffectAcpSchema.SessionConfigOption> | undefined
+        | {
+            readonly sessionId: string;
+            readonly options: ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
+          }
+        | undefined
       >(undefined);
       const modelsAdvertised = yield* Deferred.make<void>();
+      const switchedConfiguration =
+        yield* Deferred.make<ReadonlyArray<EffectAcpSchema.SessionConfigOption>>();
+      let switchingSessionId: string | undefined;
+      let legacySwitch = false;
       yield* runtime.handleElicitation((request) =>
         Effect.gen(function* () {
           if (
+            input.model !== undefined ||
             request.mode !== "url" ||
             !("url" in request) ||
             !("elicitationId" in request) ||
@@ -548,7 +595,17 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
         }
         if (update.sessionUpdate === "config_option_update") {
           const hasAdvertisedModels = acpRegistryAdvertisesModelCatalog(update.configOptions);
-          return Ref.set(configOptionsRef, update.configOptions).pipe(
+          const model = findModelConfigOption(update.configOptions);
+          return Ref.set(configOptionsRef, {
+            sessionId: notification.sessionId,
+            options: update.configOptions,
+          }).pipe(
+            Effect.andThen(
+              notification.sessionId === switchingSessionId &&
+                (model?.currentValue === input.model || (legacySwitch && model === undefined))
+                ? Deferred.succeed(switchedConfiguration, update.configOptions)
+                : Effect.void,
+            ),
             Effect.andThen(
               hasAdvertisedModels
                 ? Deferred.succeed(modelsAdvertised, undefined).pipe(Effect.asVoid)
@@ -558,6 +615,37 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
         }
         return Effect.void;
       });
+      let isolatedDropstone = false;
+      if (input.model !== undefined || dropstoneDatabase !== undefined) {
+        const initialized = yield* runtime.initialize();
+        const sessions = initialized.agentCapabilities?.sessionCapabilities;
+        if (dropstoneDatabase !== undefined && sessions?.delete == null) {
+          const fs = yield* FileSystem.FileSystem;
+          // Dropstone 1.0.67 opens DROPSTONE_DB before replying to initialize and keeps rows on close.
+          isolatedDropstone =
+            initialized.protocolVersion === 1 &&
+            initialized.agentInfo?.name === "Dropstone" &&
+            initialized.agentInfo.version === "1.0.67" &&
+            sessions?.close != null &&
+            (yield* fs.stat(dropstoneDatabase).pipe(
+              Effect.map((info) => info.type === "File" && info.size > 0n),
+              Effect.orElseSucceed(() => false),
+            ));
+          if (!isolatedDropstone) {
+            return yield* new AcpRegistryOperationError({
+              reason: "probe_failed",
+              message:
+                "Could not verify that the Dropstone agent opened the temporary probe database.",
+            });
+          }
+        }
+        if (input.model !== undefined && sessions?.delete == null && !isolatedDropstone) {
+          return yield* new AcpRegistryOperationError({
+            reason: "session_delete_unsupported",
+            message: "The ACP agent does not advertise disposable session cleanup.",
+          });
+        }
+      }
       const startResult = yield* Effect.result(runtime.start());
       if (Result.isFailure(startResult)) {
         return yield* acpRegistryProbeFailure(
@@ -570,9 +658,10 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
       // Agents that persist sessions (OpenCode) would otherwise keep one empty session per probe.
       // The runtime only sends session/delete when the agent advertises it.
       yield* Effect.addFinalizer(() =>
-        runtime
-          .deleteSession(started.sessionId)
-          .pipe(Effect.timeoutOption(PROBE_SESSION_DELETE_TIMEOUT), Effect.ignore),
+        (isolatedDropstone
+          ? runtime.closeSession(started.sessionId)
+          : runtime.deleteSession(started.sessionId)
+        ).pipe(Effect.timeoutOption(PROBE_SESSION_DELETE_TIMEOUT), Effect.ignore),
       );
       const hasInitialModels = acpRegistryAdvertisesModelCatalog(
         started.sessionSetupResult.configOptions,
@@ -586,25 +675,76 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
             : Deferred.await(modelsAdvertised).pipe(
                 Effect.timeoutOption(MODEL_ADVERTISEMENT_GRACE),
               ),
-          Deferred.await(commandsAdvertised).pipe(
-            Effect.timeoutOption(COMMAND_ADVERTISEMENT_GRACE),
-          ),
+          input.model === undefined
+            ? Deferred.await(commandsAdvertised).pipe(
+                Effect.timeoutOption(COMMAND_ADVERTISEMENT_GRACE),
+              )
+            : Effect.void,
         ],
         { concurrency: "unbounded" },
       );
 
       // config_option_update replaces the full option set, so an empty notice is authoritative.
+      const latestOptions = yield* Ref.get(configOptionsRef);
+      const advertisedOptions =
+        latestOptions?.sessionId === started.sessionId ? latestOptions.options : undefined;
+      const configOptions = advertisedOptions ?? (yield* runtime.getConfigOptions);
+      const modelState = started.sessionSetupResult.models;
       const liveConfiguration = normalizeAcpRegistryLiveConfiguration(
-        (yield* Ref.get(configOptionsRef)) ?? (yield* runtime.getConfigOptions),
+        configOptions,
         (yield* runtime.getModeState) ?? parseSessionModeState(started.sessionSetupResult),
-        started.sessionSetupResult.models,
+        modelState,
+        advertisedOptions !== undefined ||
+          configOptions.length > 0 ||
+          started.sessionSetupResult.configOptions != null,
       );
+      const target = input.model;
+      let modelConfiguration: AcpRegistryLiveConfiguration | undefined;
+      if (target !== undefined) {
+        if (liveConfiguration.currentModelId === target) {
+          if (liveConfiguration.configOptionsKnown) modelConfiguration = liveConfiguration;
+        } else if (liveConfiguration.models.some(({ id }) => id === target)) {
+          const modelOption = findModelConfigOption(configOptions);
+          legacySwitch = modelOption === undefined;
+          switchingSessionId = started.sessionId;
+          modelConfiguration = yield* Effect.gen(function* () {
+            if (modelOption !== undefined) {
+              yield* runtime.setConfigOption(modelOption.id, target);
+              const current = yield* runtime.getConfigOptions;
+              const confirmed =
+                findModelConfigOption(current)?.currentValue === target
+                  ? current
+                  : yield* Deferred.await(switchedConfiguration);
+              const observed = normalizeAcpRegistryLiveConfiguration(
+                confirmed,
+                undefined,
+                modelState,
+              );
+              return findModelConfigOption(confirmed)?.currentValue === target
+                ? observed
+                : undefined;
+            }
+            if (modelState == null || started.initializeResult.protocolVersion !== 1) return;
+            yield* runtime.setSessionModel(target);
+            const observed = yield* Deferred.await(switchedConfiguration);
+            return normalizeAcpRegistryLiveConfiguration(observed, undefined, {
+              ...modelState,
+              currentModelId: target,
+            });
+          }).pipe(
+            Effect.timeoutOption(MODEL_CONFIGURATION_TIMEOUT),
+            Effect.map(Option.getOrUndefined),
+          );
+        }
+      }
 
       return {
         resolved,
         started,
         commands: yield* Ref.get(commandsRef),
         liveConfiguration,
+        modelConfiguration,
+        isolatedDropstone,
       };
     }).pipe(
       Effect.scoped,
@@ -635,6 +775,11 @@ export const probeAcpRegistryConfiguration = Effect.fn("AcpRegistryProbe.probeCo
       ),
       slashCommands: result.commands.slashCommands,
       skills: result.commands.skills,
+      configuration: result.liveConfiguration,
+      ...(result.isolatedDropstone ? { canDiscoverModelOptions: true } : {}),
+      ...(result.modelConfiguration === undefined
+        ? {}
+        : { modelConfiguration: result.modelConfiguration }),
     };
   },
 );

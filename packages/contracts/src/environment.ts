@@ -132,6 +132,7 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   providerWorkspaceSnapshotsOnDemand: Schema.optionalKey(Schema.Boolean),
   /** Honors `modelCatalogOnly`; older servers drop the field and probe every provider. */
   modelCatalogRefresh: Schema.optionalKey(Schema.Boolean),
+  acpModelOptionDiscovery: Schema.optionalKey(Schema.Boolean),
   usagePriceOverrides: Schema.optionalKey(Schema.Boolean),
   usageModelAliases: Schema.optionalKey(Schema.Boolean),
   threadPinning: Schema.optionalKey(Schema.Boolean),

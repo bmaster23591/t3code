@@ -159,6 +159,27 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
 
   const activeEntry =
     props.instanceEntries.find((entry) => entry.instanceId === props.activeInstanceId) ?? null;
+  const discoverableModel =
+    activeEntry?.driverKind === "acpRegistry" &&
+    (activeEntry.snapshot.nativeSessions?.canDiscoverModelOptions ??
+      activeEntry.snapshot.nativeSessions?.canDelete) === true &&
+    activeEntry.models.some((model) => model.slug === props.model && !model.isCustom);
+  const discoverAcpOptions = useEffectEvent(
+    (environmentId: EnvironmentId, instanceId: ProviderInstanceId, model: string) => {
+      const config = registry.get(serverEnvironment.configValueAtom(environmentId));
+      if (config?.environment.capabilities.acpModelOptionDiscovery !== true) return;
+      void refreshProviders({
+        environmentId,
+        input: { instanceId, discoverAcpModel: model },
+      });
+    },
+  );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- model changes from the picker, keyboard shortcuts and restored drafts can all need ACP discovery
+  useEffect(() => {
+    if (discoverableModel && props.environmentId !== null) {
+      discoverAcpOptions(props.environmentId, props.activeInstanceId, props.model);
+    }
+  }, [discoverableModel, props.environmentId, props.activeInstanceId, props.model]);
 
   const activeInstanceId = props.activeInstanceId;
   const selectedInstanceOptions = props.modelOptionsByInstance.get(activeInstanceId) ?? [];

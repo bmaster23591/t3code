@@ -12,12 +12,14 @@ import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import { toCustomModelSetting } from "@t3tools/shared/model";
 import { AcpRegistrySettings } from "../settings.ts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
@@ -375,6 +377,22 @@ describe("acpRegistrySnapshotReadiness", () => {
     });
     expect(afterOpus.find((model) => model.slug === "opus")).toMatchObject({
       capabilities: { optionDescriptors: [{ id: "thinking" }, { id: "mode" }] },
+    });
+    const unattributed = applyAcpRegistryLiveConfiguration(
+      { ...provider, models: afterOpus },
+      {
+        models: [],
+        currentModelId: null,
+        configOptions: [liveOptions[0]!, sharedMode],
+        modelOptionIds: ["effort"],
+      },
+      ["custom"],
+    );
+    expect(unattributed.models.find((model) => model.slug === "opus")).toMatchObject({
+      capabilities: { optionDescriptors: [{ id: "mode" }, { id: "thinking" }] },
+    });
+    expect(unattributed.models.find((model) => model.slug === "custom")).toMatchObject({
+      capabilities: { optionDescriptors: [sharedMode] },
     });
 
     // Other models take the levels they advertise in `_meta`.
@@ -1016,12 +1034,11 @@ it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) =
             }),
         }),
       );
-      const modelSlugs = instance.snapshot.streamChanges.pipe(
-        Stream.map((snapshot) => snapshot.models.map((model) => model.slug)),
-      );
       const waitForModels = (expected: ReadonlyArray<string>) =>
-        modelSlugs.pipe(
-          Stream.filter((slugs) => slugs.join() === expected.join()),
+        instance.snapshot.streamChanges.pipe(
+          Stream.filter(
+            (snapshot) => snapshot.models.map((model) => model.slug).join() === expected.join(),
+          ),
           Stream.runHead,
         );
 
@@ -1030,16 +1047,35 @@ it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) =
       );
       yield* instance.snapshot.refresh;
       yield* Fiber.join(probed);
+      const learned = yield* waitForModels(["old-model", "session-model"]).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
       yield* coordinator.publishLiveConfiguration(
         identity.instanceId,
-        normalizeAcpRegistryLiveConfiguration([], undefined, {
-          currentModelId: "old-model",
-          availableModels: [
-            { modelId: "old-model", name: "old-model" },
-            { modelId: "session-model", name: "session-model" },
+        normalizeAcpRegistryLiveConfiguration(
+          [
+            {
+              id: "effort",
+              name: "Effort",
+              category: "thought_level",
+              type: "select",
+              currentValue: "high",
+              options: [{ value: "high", name: "High" }],
+            },
           ],
-        }),
+          undefined,
+          {
+            currentModelId: "session-model",
+            availableModels: [
+              { modelId: "old-model", name: "old-model" },
+              { modelId: "session-model", name: "session-model" },
+            ],
+          },
+        ),
       );
+      expect(
+        Option.getOrUndefined(yield* Fiber.join(learned))?.models[1]?.capabilities,
+      ).toMatchObject({ optionDescriptors: [{ id: "effort" }] });
       yield* fileSystem.writeFileString(modelsPath, JSON.stringify(["old-model", "new-model"]));
 
       const refreshed = yield* waitForModels(["old-model", "new-model"]).pipe(
@@ -1048,6 +1084,16 @@ it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) =
       yield* instance.invalidateCaches ?? Effect.void;
       yield* instance.snapshot.refresh;
       expect(Option.isSome(yield* Fiber.join(refreshed))).toBe(true);
+
+      yield* fileSystem.writeFileString(modelsPath, JSON.stringify(["old-model", "session-model"]));
+      const returned = yield* waitForModels(["old-model", "session-model"]).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* instance.invalidateCaches ?? Effect.void;
+      yield* instance.snapshot.refresh;
+      expect(
+        Option.getOrUndefined(yield* Fiber.join(returned))?.models[1]?.capabilities,
+      ).toMatchObject({ optionDescriptors: [] });
     }),
   );
 
@@ -1187,5 +1233,135 @@ it.layer(driverLayer, { excludeTestServices: true })("AcpRegistryDriver", (it) =
         "model-a:effort,model-b:effort",
       );
     }),
+  );
+
+  it.effect(
+    "deduplicates model discovery, preserves it across refresh, and prefers a newer session",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "acp-model-discovery-" });
+        const requestLogPath = path.join(directory, "requests.ndjson");
+        const mockAgent = yield* path.fromFileUrl(
+          new URL("../../../../apps/server/scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const coordinator = yield* AcpRegistryRuntimeCoordinator.AcpRegistryRuntimeCoordinator;
+        const blockNext = yield* Ref.make(false);
+        const blocked = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const instance = yield* AcpRegistryDriver.create({
+          instanceId: identity.instanceId,
+          displayName: identity.displayName,
+          enabled: true,
+          environment: [],
+          config: decodeSettings({ agentId: "test-agent" }),
+        }).pipe(
+          Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, {
+            ...catalogWithInspection({
+              status: "ready",
+              agentId: "test-agent",
+              version: "1.0.0",
+              distribution: "npx",
+            }),
+            resolve: Effect.fn("AcpRegistryDriverTest.resolve")(function* () {
+              if (yield* Ref.getAndSet(blockNext, false)) {
+                yield* Deferred.succeed(blocked, undefined);
+                yield* Deferred.await(release);
+              }
+              return {
+                distribution: "npx" as const,
+                spawn: {
+                  command: process.execPath,
+                  args: [mockAgent],
+                  env: {
+                    ...process.env,
+                    T3_ACP_DISCOVERY_MODEL: "pro",
+                    T3_ACP_V2_MANAGEMENT: "1",
+                    T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+                  },
+                },
+              };
+            }),
+          }),
+        );
+        const discover = instance.discoverModelOptions!;
+        const reasoning = (snapshot: ServerProvider, model: string) =>
+          snapshot.models
+            .find((entry) => entry.slug === model)
+            ?.capabilities?.optionDescriptors?.flatMap((option) =>
+              option.type === "select" && option.role === "reasoning"
+                ? option.options.map((choice) => choice.id)
+                : [],
+            )
+            .join(",");
+        const waitForSnapshot = (matches: (snapshot: ServerProvider) => boolean) =>
+          instance.snapshot.streamChanges.pipe(
+            Stream.filter(matches),
+            Stream.runHead,
+            Effect.forkScoped({ startImmediately: true }),
+          );
+        const probed = yield* waitForSnapshot(
+          (snapshot) => snapshot.nativeSessions?.canDelete === true,
+        );
+        yield* instance.snapshot.refresh;
+        yield* Fiber.join(probed);
+
+        yield* Effect.all([discover("fast"), discover("fast")], { concurrency: "unbounded" });
+        expect(reasoning(yield* instance.snapshot.getSnapshot, "fast")).toBe("low,medium");
+        const refreshed = yield* waitForSnapshot(
+          (snapshot) =>
+            snapshot.nativeSessions?.canDelete === true &&
+            reasoning(snapshot, "fast") === "low,medium",
+        );
+        yield* instance.invalidateCaches ?? Effect.void;
+        yield* instance.snapshot.refresh;
+        yield* Fiber.join(refreshed);
+        yield* discover("fast");
+        yield* discover("plain");
+        yield* discover("plain");
+
+        yield* Ref.set(blockNext, true);
+        const slowDiscovery = yield* discover("heavy").pipe(Effect.forkScoped);
+        yield* Deferred.await(blocked);
+        const live = yield* waitForSnapshot(
+          (snapshot) => reasoning(snapshot, "heavy") === "medium",
+        );
+        yield* coordinator.publishLiveConfiguration(
+          identity.instanceId,
+          normalizeAcpRegistryLiveConfiguration([
+            {
+              id: "model",
+              name: "Model",
+              category: "model",
+              type: "select",
+              currentValue: "heavy",
+              options: ["fast", "pro", "heavy", "plain"].map((value) => ({ value, name: value })),
+            },
+            {
+              id: "effort",
+              name: "Effort",
+              category: "thought_level",
+              type: "select",
+              currentValue: "medium",
+              options: [{ value: "medium", name: "Medium" }],
+            },
+          ]),
+        );
+        yield* Fiber.join(live);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(slowDiscovery);
+        expect(reasoning(yield* instance.snapshot.getSnapshot, "heavy")).toBe("medium");
+        const requests = (yield* fs.readFileString(requestLogPath))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        expect(
+          requests.flatMap((request) =>
+            request.method === "session/set_config_option" ? [request.params.value] : [],
+          ),
+        ).toEqual(["fast", "plain", "heavy"]);
+        expect(requests.some((request) => request.method === "session/prompt")).toBe(false);
+      }),
   );
 });

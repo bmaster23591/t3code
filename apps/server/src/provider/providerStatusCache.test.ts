@@ -122,6 +122,30 @@ it.layer(NodeServices.layer)("providerStatusCache", (it) => {
     );
   });
 
+  it("hydrates an ACP catalog without treating cached session options as current", () => {
+    const driver = ProviderDriverKind.make("acpRegistry");
+    const capabilities = createModelCapabilities({
+      optionDescriptors: [
+        {
+          id: "effort",
+          label: "Reasoning",
+          role: "reasoning",
+          type: "select",
+          options: [{ id: "high", label: "High" }],
+        },
+      ],
+    });
+    const advertised = { slug: "fast", name: "Fast", isCustom: false, capabilities };
+    const explicit = { slug: "custom", name: "Custom", isCustom: true, capabilities };
+    assert.deepStrictEqual(
+      hydrateCachedProvider({
+        cachedProvider: makeProvider(driver, { models: [advertised] }),
+        fallbackProvider: makeProvider(driver, { models: [explicit] }),
+      }).models,
+      [explicit, { ...advertised, capabilities: null }],
+    );
+  });
+
   it("ignores stale cached enabled state when the provider is now disabled", () => {
     const cachedCodex = makeProvider(CODEX_DRIVER, {
       checkedAt: "2026-04-10T12:00:00.000Z",

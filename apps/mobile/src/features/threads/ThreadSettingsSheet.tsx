@@ -523,17 +523,57 @@ function ThreadSettingsSessionProvider(
   const isDisplayed = (option: ModelOption) =>
     pendingModel ? option.key === pendingModel.key : isApplied(option);
 
+  const displayedModel =
+    providerGroups.flatMap((group) => group.models).find(isDisplayed) ?? pendingModel;
   const displayedDescriptors = pendingModel
     ? resolveProviderOptionDescriptors({
-        capabilities: pendingModel.capabilities,
+        capabilities: displayedModel?.capabilities,
         selections: pendingModel.selection.options,
       })
     : props.optionDescriptors;
   const promptTraits = getPromptControlledTraits(displayedDescriptors, displayedPrompt);
-  const displayedModel =
-    pendingModel ??
-    props.providerGroups.flatMap((group) => group.models).find((option) => isApplied(option)) ??
-    null;
+  const refreshProviders = useAtomCommand(serverEnvironment.refreshProviders, {
+    reportFailure: false,
+  });
+  const discoveryInstance = displayedModel?.selection.instanceId;
+  const discoveryModel = displayedModel?.selection.model;
+  const discoverableModel =
+    displayedModel?.providerDriver === "acpRegistry" &&
+    !displayedModel.isLegacy &&
+    !displayedModel.isUnavailable &&
+    config?.environment.capabilities.acpModelOptionDiscovery === true &&
+    config.providers.some(
+      (provider) =>
+        provider.instanceId === discoveryInstance &&
+        (provider.nativeSessions?.canDiscoverModelOptions ?? provider.nativeSessions?.canDelete) ===
+          true,
+    );
+  const discoverAcpOptions = useEffectEvent(
+    (environmentId: EnvironmentId, instanceId: ProviderInstanceId, model: string) => {
+      void refreshProviders({
+        environmentId,
+        input: { instanceId, discoverAcpModel: model },
+      });
+    },
+  );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- queries ACP for the selected draft model and renders the published options while the sheet is open
+  useEffect(() => {
+    if (
+      discoverableModel &&
+      props.environmentId &&
+      discoveryInstance &&
+      discoveryModel &&
+      connectionGeneration !== null
+    ) {
+      discoverAcpOptions(props.environmentId, discoveryInstance, discoveryModel);
+    }
+  }, [
+    discoverableModel,
+    props.environmentId,
+    discoveryInstance,
+    discoveryModel,
+    connectionGeneration,
+  ]);
   const runtimeModeChoices = withManagedRuntimeModeLimits(
     runtimeModeChoicesForSupportedModes(displayedModel?.supportedRuntimeModes),
     [config?.managedPolicy],

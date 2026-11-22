@@ -113,6 +113,7 @@ import {
   ACP_EMPTY_OPTION_VALUE,
   ACP_SESSION_MODE_OPTION_ID,
   flattenSelectChoices,
+  isAcpThoughtLevelOption,
 } from "./sessionConfig.ts";
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
 import {
@@ -433,6 +434,7 @@ export interface AcpAdapterV2Flavor {
     configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
     modeState: AcpSessionModeState | undefined,
     modelState: EffectAcpSchema.SessionModelState | null | undefined,
+    configOptionsKnown: boolean,
   ) => Effect.Effect<void>;
   readonly onUrlElicitation?: (input: {
     readonly elicitationId: string;
@@ -2283,9 +2285,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         } | null>(null);
         const activeSessionSetup =
           yield* Ref.make<AcpSessionRuntime.AcpSessionRuntimeStartResult | null>(null);
+        let configBeforeLegacySwitch:
+          | ReadonlyArray<EffectAcpSchema.SessionConfigOption>
+          | undefined;
+        let changingLegacyModel = false;
+        let awaitingModelSelector: string | undefined;
         const setActiveSessionSetup = Effect.fnUntraced(function* (
           setup: AcpSessionRuntime.AcpSessionRuntimeStartResult,
         ) {
+          configBeforeLegacySwitch = undefined;
+          awaitingModelSelector = undefined;
           followsAgentWorkState =
             flavor.followAgentWorkState === true &&
             continuationRequests !== undefined &&
@@ -7083,11 +7092,22 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 notification.update.sessionUpdate === "config_option_update" ||
                 notification.update.sessionUpdate === "current_mode_update"
               ) {
+                const configOptions = yield* runtime.getConfigOptions;
+                const setup = (yield* Ref.get(activeSessionSetup))?.sessionSetupResult;
+                if (findModelConfigOption(configOptions)?.currentValue === awaitingModelSelector) {
+                  awaitingModelSelector = undefined;
+                }
                 yield* (
                   flavor.onSessionConfigurationUpdate?.(
-                    yield* runtime.getConfigOptions,
+                    configOptions,
                     yield* runtime.getModeState,
-                    (yield* Ref.get(activeSessionSetup))?.sessionSetupResult.models,
+                    changingLegacyModel || awaitingModelSelector !== undefined
+                      ? undefined
+                      : setup?.models,
+                    configOptions !== configBeforeLegacySwitch &&
+                      (notification.update.sessionUpdate === "config_option_update" ||
+                        configOptions.length > 0 ||
+                        setup?.configOptions != null),
                   ) ?? Effect.void
                 );
               }
@@ -7205,6 +7225,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             return;
           }
           yield* Ref.set(activeSessionSetup, result);
+          configBeforeLegacySwitch = undefined;
+          awaitingModelSelector = undefined;
           // The selection was configured against the provisional setup's
           // options, so the next turn re-applies it against the real ones.
           yield* Ref.set(activeSelection, null);
@@ -7224,6 +7246,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               yield* targetRuntime.getConfigOptions,
               yield* targetRuntime.getModeState,
               result.sessionSetupResult.models,
+              result.sessionSetupResult.configOptions != null,
             ) ?? Effect.void
           );
         });
@@ -8107,6 +8130,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               ? new AcpModelSelectionError({ model: modelSelection.model, cause: error })
               : error;
           let appliedModel: string | undefined;
+          let selectedModelOption = false;
           if (flavor.applyModelSelection !== undefined) {
             appliedModel = yield* flavor
               .applyModelSelection({
@@ -8128,12 +8152,25 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   (choice) => choice.value === requestedModel,
                 )
               ) {
+                if (modelOption.currentValue !== requestedModel) {
+                  awaitingModelSelector = requestedModel;
+                }
                 yield* runtime
                   .setConfigOption(modelOption.id, requestedModel, {
                     resendCurrentValue: flavor.alwaysSetModel === true,
                   })
-                  .pipe(Effect.mapError(rejectedModel));
+                  .pipe(
+                    Effect.onExit((exit) =>
+                      exit._tag === "Failure"
+                        ? Effect.sync(() => {
+                            awaitingModelSelector = undefined;
+                          })
+                        : Effect.void,
+                    ),
+                    Effect.mapError(rejectedModel),
+                  );
                 appliedModel = requestedModel;
+                selectedModelOption = true;
               }
             } else if (
               modelState != null &&
@@ -8141,7 +8178,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 modelState.availableModels.some((model) => model.modelId === requestedModel))
             ) {
               if (modelState.currentModelId !== requestedModel) {
-                yield* runtime.setSessionModel(requestedModel).pipe(Effect.mapError(rejectedModel));
+                configBeforeLegacySwitch = yield* runtime.getConfigOptions;
+                changingLegacyModel = true;
+                yield* runtime.setSessionModel(requestedModel).pipe(
+                  Effect.onExit((exit) =>
+                    exit._tag === "Failure"
+                      ? Effect.sync(() => {
+                          changingLegacyModel = false;
+                          configBeforeLegacySwitch = undefined;
+                        })
+                      : Effect.void,
+                  ),
+                  Effect.mapError(rejectedModel),
+                );
               }
               appliedModel = requestedModel;
             }
@@ -8165,7 +8214,26 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               };
             });
           }
-          const configOptions = yield* runtime.getConfigOptions;
+          changingLegacyModel = false;
+          let configOptions = yield* runtime.getConfigOptions;
+          if (flavor.onSessionConfigurationUpdate && modelSelection.options?.length) {
+            const matchesModel = (options: typeof configOptions) =>
+              selectedModelOption
+                ? findModelConfigOption(options)?.currentValue === appliedModel
+                : options !== configBeforeLegacySwitch;
+            if (!matchesModel(configOptions)) {
+              const updated = yield* runtime.configOptionChanges.pipe(
+                Stream.filter(matchesModel),
+                Stream.runHead,
+                Effect.timeoutOption("5 seconds"),
+              );
+              configOptions = Option.flatten(updated).pipe(Option.getOrElse(() => configOptions));
+            }
+          }
+          const modelOptionsReady =
+            configOptions !== configBeforeLegacySwitch &&
+            (!selectedModelOption ||
+              findModelConfigOption(configOptions)?.currentValue === appliedModel);
           // A picked mode applies only when the flavor places it within the bound; an unknown mode
           // could be the agent's own skip-approval mode. Modes known to be permission levels are
           // also bounded by the thread's runtime mode, so model options cannot widen it.
@@ -8235,6 +8303,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             if (!availableConfigIds.has(selection.id)) continue;
             // Advertised values union models; skip per-model rejections instead of failing session open.
             const option = configOptions.find((candidate) => candidate.id === selection.id);
+            if (
+              flavor.onSessionConfigurationUpdate &&
+              !modelOptionsReady &&
+              option !== undefined &&
+              (isAcpThoughtLevelOption(option) || option.category === "model_config")
+            )
+              continue;
             if (
               option !== undefined &&
               option.type === "select" &&
@@ -8358,11 +8433,18 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           }
           yield* validateModelSelection(modelSelection);
           yield* Ref.set(configuredRuntimeMode, runtimePolicy.runtimeMode);
+          const publishedOptions = yield* runtime.getConfigOptions;
+          const publishedSetup = (yield* Ref.get(activeSessionSetup))?.sessionSetupResult;
           yield* (
             flavor.onSessionConfigurationUpdate?.(
-              yield* runtime.getConfigOptions,
+              publishedOptions,
               yield* runtime.getModeState,
-              (yield* Ref.get(activeSessionSetup))?.sessionSetupResult.models,
+              awaitingModelSelector !== undefined &&
+                findModelConfigOption(publishedOptions) === undefined
+                ? undefined
+                : publishedSetup?.models,
+              publishedOptions !== configBeforeLegacySwitch &&
+                (publishedOptions.length > 0 || publishedSetup?.configOptions != null),
             ) ?? Effect.void
           );
         });

@@ -85,6 +85,15 @@ Other settings the agent offers, such as reasoning effort or approval mode, appe
 composer's model picker, beside the model list, like they do for built-in providers. Models and options that change while an agent
 is running update the picker without waiting for another provider probe.
 
+For agents that support disposable session cleanup, T3 Code can discover a selected model's
+reasoning options before you send a message. If the agent cannot report those options during
+discovery, the model is still usable. Its controls can appear once an active session advertises
+them.
+
+For Dropstone CLI 1.0.67, use the Dropstone executable as the local ACP command or pass it as
+an argument to your launcher. T3 Code uses a temporary database for discovery and verifies that
+Dropstone opened it before creating a session. Existing Dropstone sessions use their usual database.
+
 ## Commands and skills
 
 Slash commands the agent provides appear under **Provider** in the `/` menu while a session is

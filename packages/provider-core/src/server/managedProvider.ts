@@ -74,7 +74,11 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   readonly refreshOnInterval?: boolean | ((snapshot: ServerProvider) => boolean);
   readonly checkProviderOnSettingsChange?: (previous: Settings, next: Settings) => boolean;
 }): Effect.fn.Return<
-  ManagedServerProvider,
+  ManagedServerProvider & {
+    readonly updateSnapshot: (
+      update: (current: ServerProvider) => ServerProvider,
+    ) => Effect.Effect<void>;
+  },
   ServerSettingsError,
   Scope.Scope | ProviderHost.ProviderHost
 > {
@@ -99,13 +103,14 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   const scope = yield* Effect.scope;
 
   const publishEnrichedSnapshot = Effect.fn("publishEnrichedSnapshot")(function* (
-    generation: number,
-    nextSnapshot: ServerProvider,
+    generation: number | undefined,
+    update: (current: ServerProvider) => ServerProvider,
   ) {
     const snapshotToPublish = yield* Ref.modify(snapshotStateRef, (state) => {
-      if (state.enrichmentGeneration !== generation) {
+      if (generation !== undefined && state.enrichmentGeneration !== generation) {
         return [null, state] as const;
       }
+      const nextSnapshot = update(state.snapshot);
       // Enrichment must not revert usage updates newer than its input snapshot.
       const merged = withUsageLimits(
         state.usageAuthLabel === undefined
@@ -146,7 +151,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
         settings,
         snapshot,
         getSnapshot: Ref.get(snapshotStateRef).pipe(Effect.map((state) => state.snapshot)),
-        publishSnapshot: (nextSnapshot) => publishEnrichedSnapshot(generation, nextSnapshot),
+        publishSnapshot: (nextSnapshot) => publishEnrichedSnapshot(generation, () => nextSnapshot),
       })
       .pipe(Effect.ignoreCause({ log: true }), Effect.forkIn(scope));
 
@@ -465,6 +470,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   return {
     resolveMaintenance: input.resolveMaintenance,
     getSnapshot: Ref.get(snapshotStateRef).pipe(Effect.map((state) => state.snapshot)),
+    updateSnapshot: (update) => publishEnrichedSnapshot(undefined, update),
     isAwaitingFirstCheck: Ref.get(snapshotStateRef).pipe(Effect.map((state) => !state.checked)),
     refresh: input
       .resolveMaintenance({ fresh: true })
@@ -474,5 +480,5 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     get streamChanges() {
       return Stream.fromPubSub(changesPubSub);
     },
-  } satisfies ManagedServerProvider;
+  };
 });

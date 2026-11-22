@@ -77,9 +77,14 @@ export const hydrateCachedProvider = (input: {
   }
 
   const { message: _fallbackMessage, ...fallbackWithoutMessage } = input.fallbackProvider;
+  // Cached ACP rows carry no proof that their options still match the executable or account.
+  const cachedModels =
+    input.cachedProvider.driver === "acpRegistry"
+      ? input.cachedProvider.models.map((model) => ({ ...model, capabilities: null }))
+      : input.cachedProvider.models;
   const hydratedProvider: ServerProvider = {
     ...fallbackWithoutMessage,
-    models: mergeProviderModels(input.fallbackProvider.models, input.cachedProvider.models),
+    models: mergeProviderModels(input.fallbackProvider.models, cachedModels),
     installed: input.cachedProvider.installed,
     version: input.cachedProvider.version,
     status: input.cachedProvider.status,

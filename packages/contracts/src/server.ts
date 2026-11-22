@@ -255,6 +255,7 @@ export const ServerProvider = Schema.Struct({
       canLoad: Schema.Boolean,
       canResume: Schema.Boolean,
       canDelete: Schema.optional(Schema.Boolean),
+      canDiscoverModelOptions: Schema.optionalKey(Schema.Boolean),
     }),
   ),
   configurableProviders: Schema.optional(Schema.Boolean),

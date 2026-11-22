@@ -70,6 +70,10 @@ export class ProviderRegistry extends Context.Service<
     readonly refreshInstance: (
       instanceId: ProviderInstanceId,
     ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
+    readonly discoverAcpModelOptions: (
+      instanceId: ProviderInstanceId,
+      model: string,
+    ) => Effect.Effect<void>;
 
     /** Re-reads secret-backed environments first, so a fixed secret applies without a restart. */
     readonly reloadSecretsAndRefresh: (
@@ -1344,6 +1348,12 @@ export const layer = Layer.effect(
         refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshInstance: (instanceId: ProviderInstanceId) =>
         refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+      discoverAcpModelOptions: (instanceId, model) =>
+        instanceRegistry
+          .getInstance(instanceId)
+          .pipe(
+            Effect.flatMap((instance) => instance?.discoverModelOptions?.(model) ?? Effect.void),
+          ),
       reloadSecretsAndRefresh: (instanceId?: ProviderInstanceId) =>
         reloadSecretsAndRefresh(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
       applySecretAndRefresh: (reference: SecretReference, value: string) =>

@@ -5076,14 +5076,18 @@ describe("AcpAdapterV2", () => {
       const lateConfigOptions = yield* Deferred.make<void>();
       let acpRuntime: AcpSessionRuntime.AcpSessionRuntime["Service"] | undefined;
       const publishedConfigurations: Array<ReadonlyArray<EffectAcpSchema.SessionConfigOption>> = [];
+      const configurationKnown: boolean[] = [];
       const instanceId = ProviderInstanceId.make("acp-test-late-session-load");
       const adapter = yield* makeAcpAdapterV2({
         instanceId,
         flavor: {
           driver: ACP_TEST_DRIVER,
           capabilities: AcpProviderCapabilitiesV2,
-          onSessionConfigurationUpdate: (configOptions) =>
-            Effect.sync(() => publishedConfigurations.push(configOptions)),
+          onSessionConfigurationUpdate: (configOptions, _mode, _model, known) =>
+            Effect.sync(() => {
+              publishedConfigurations.push(configOptions);
+              configurationKnown.push(known);
+            }),
           makeRuntime: makeMockRuntime({
             childProcessSpawner,
             mockAgentPath,
@@ -5131,6 +5135,7 @@ describe("AcpAdapterV2", () => {
         runtime.providerSession.capabilities.sessions.supportsModelSwitchInSession,
         "model switching stays disabled after the late session/load response offered a model",
       );
+      assert.deepEqual(configurationKnown, [false, true]);
       // Registry agents fill their model picker from this callback.
       assert.equal(
         publishedConfigurations.filter((options) =>
