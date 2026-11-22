@@ -570,6 +570,22 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }),
   );
 
+  it.effect("omits the server bytecode generation hook from Windows installers", () =>
+    Effect.gen(function* () {
+      const windows = yield* createBuildConfig(
+        "win",
+        "nsis",
+        "0.1.11",
+        false,
+        false,
+        undefined,
+        undefined,
+      );
+
+      assert.notProperty(windows, "afterPack");
+    }),
+  );
+
   it.effect("names updatable AppImages without a version and apart per channel", () =>
     Effect.gen(function* () {
       const appImageName = (version: string) =>
